@@ -15,6 +15,10 @@ import { notFound, errorHandler } from './middleware/error.js';
 
 const app = express();
 
+// Render / most PaaS run behind a proxy that sets X-Forwarded-For.
+// Trust the first proxy hop so express-rate-limit reads the real client IP.
+app.set('trust proxy', 1);
+
 // security & parsing
 app.use(helmet());
 app.use(
