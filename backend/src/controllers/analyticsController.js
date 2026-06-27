@@ -1,18 +1,13 @@
-import Room from '../models/Room.js';
-import Guest from '../models/Guest.js';
-import Payment from '../models/Payment.js';
-import InventoryItem from '../models/InventoryItem.js';
+import { supabase } from '../config/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
 import { buildFinanceForGuests, round2 } from '../utils/finance.js';
+import { mapGuest, mapInventory } from '../utils/map.js';
 
 function dayBounds(now = new Date()) {
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(now);
-  end.setHours(23, 59, 59, 999);
+  const start = new Date(now); start.setHours(0, 0, 0, 0);
+  const end = new Date(now); end.setHours(23, 59, 59, 999);
   return { start, end };
 }
-
 function monthBounds(now = new Date()) {
   const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
   const end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
@@ -25,36 +20,50 @@ export const dashboard = asyncHandler(async (req, res) => {
   const { start: dayStart, end: dayEnd } = dayBounds(now);
   const { start: monthStart, end: monthEnd } = monthBounds(now);
 
-  // Run every independent query concurrently — one round-trip's worth of latency.
+  // Run independent queries concurrently.
   const [
-    totalRooms,
-    occupiedRooms,
-    checkInsToday,
-    checkOutsToday,
-    revToday,
-    revMonth,
-    guests,
-    lowStockItems,
+    roomsRes,
+    checkInsRes,
+    checkOutsRes,
+    revTodayRes,
+    revMonthRes,
+    guestsRes,
+    invRes,
   ] = await Promise.all([
-    Room.countDocuments(),
-    Room.countDocuments({ status: 'occupied' }),
-    Guest.countDocuments({ checkInDate: { $gte: dayStart, $lte: dayEnd } }),
-    Guest.countDocuments({ actualCheckOutDate: { $gte: dayStart, $lte: dayEnd } }),
-    Payment.aggregate([
-      { $match: { date: { $gte: dayStart, $lte: dayEnd } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-    Payment.aggregate([
-      { $match: { date: { $gte: monthStart, $lte: monthEnd } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-    Guest.find().lean(),
-    InventoryItem.find().lean(),
+    supabase.from('rooms').select('status'),
+    supabase
+      .from('guests')
+      .select('id', { count: 'exact', head: true })
+      .gte('check_in_date', dayStart.toISOString())
+      .lte('check_in_date', dayEnd.toISOString()),
+    supabase
+      .from('guests')
+      .select('id', { count: 'exact', head: true })
+      .gte('actual_check_out_date', dayStart.toISOString())
+      .lte('actual_check_out_date', dayEnd.toISOString()),
+    supabase
+      .from('payments')
+      .select('amount')
+      .gte('date', dayStart.toISOString())
+      .lte('date', dayEnd.toISOString()),
+    supabase
+      .from('payments')
+      .select('amount')
+      .gte('date', monthStart.toISOString())
+      .lte('date', monthEnd.toISOString()),
+    supabase.from('guests').select('*'),
+    supabase.from('inventory_items').select('*'),
   ]);
 
+  const rooms = roomsRes.data || [];
+  const totalRooms = rooms.length;
+  const occupiedRooms = rooms.filter((r) => r.status === 'occupied').length;
   const occupancyRate = totalRooms ? round2((occupiedRooms / totalRooms) * 100) : 0;
 
-  // total pending dues across all guests (single payments aggregation)
+  const revToday = (revTodayRes.data || []).reduce((s, p) => s + Number(p.amount), 0);
+  const revMonth = (revMonthRes.data || []).reduce((s, p) => s + Number(p.amount), 0);
+
+  const guests = (guestsRes.data || []).map(mapGuest);
   const enriched = await buildFinanceForGuests(guests, now);
   let totalPendingDues = 0;
   let overdueCount = 0;
@@ -63,16 +72,23 @@ export const dashboard = asyncHandler(async (req, res) => {
     if (f.overdue) overdueCount += 1;
   }
 
-  const lowStockCount = lowStockItems.filter((i) => i.quantity <= i.threshold).length;
+  const lowStockCount = (invRes.data || [])
+    .map(mapInventory)
+    .filter((i) => i.quantity <= i.threshold).length;
 
   res.json({
-    rooms: { total: totalRooms, occupied: occupiedRooms, available: totalRooms - occupiedRooms, occupancyRate },
-    today: {
-      checkIns: checkInsToday,
-      checkOuts: checkOutsToday,
-      revenue: round2(revToday.length ? revToday[0].total : 0),
+    rooms: {
+      total: totalRooms,
+      occupied: occupiedRooms,
+      available: totalRooms - occupiedRooms,
+      occupancyRate,
     },
-    month: { revenue: round2(revMonth.length ? revMonth[0].total : 0) },
+    today: {
+      checkIns: checkInsRes.count || 0,
+      checkOuts: checkOutsRes.count || 0,
+      revenue: round2(revToday),
+    },
+    month: { revenue: round2(revMonth) },
     dues: { totalPending: round2(totalPendingDues), overdueGuests: overdueCount },
     inventory: { lowStockCount },
     generatedAt: now,

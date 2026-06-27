@@ -1,43 +1,53 @@
-import Guest from '../models/Guest.js';
-import Room from '../models/Room.js';
-import Payment from '../models/Payment.js';
+import { supabase } from '../config/supabase.js';
 import { asyncHandler, ApiError } from '../middleware/error.js';
 import { logActivity } from '../utils/activity.js';
-import { buildGuestFinance, buildFinanceForGuests, computeTotalCharges, round2 } from '../utils/finance.js';
+import {
+  buildGuestFinance,
+  buildFinanceForGuests,
+  computeTotalCharges,
+  round2,
+} from '../utils/finance.js';
+import { mapGuest, mapPayment, newId } from '../utils/map.js';
 
 // GET /api/guests?search=&status=&room=
 export const listGuests = asyncHandler(async (req, res) => {
   const { search, status, room } = req.query;
-  const filter = {};
-  // Coerce to strings so query-operator objects (?status[$ne]=) can't be injected.
-  if (status === 'checked-in' || status === 'checked-out') filter.status = status;
-  if (room) filter.roomNumber = String(room);
-  if (search && typeof search === 'string' && search.trim()) {
-    // Escape regex metacharacters to avoid ReDoS / invalid-pattern crashes.
-    const esc = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const rx = new RegExp(esc, 'i');
-    filter.$or = [{ name: rx }, { roomNumber: rx }, { idNumber: rx }, { phone: rx }];
-  }
-  const guests = await Guest.find(filter).sort({ createdAt: -1 }).lean();
+  let q = supabase.from('guests').select('*').order('created_at', { ascending: false });
 
-  // attach finance snapshot using ONE payments aggregation (no N+1)
+  if (status === 'checked-in' || status === 'checked-out') q = q.eq('status', status);
+  if (room) q = q.eq('room_number', String(room));
+  if (search && typeof search === 'string' && search.trim()) {
+    const s = search.trim().replace(/[%,]/g, ' ');
+    // case-insensitive OR across the searchable fields
+    q = q.or(
+      `name.ilike.%${s}%,room_number.ilike.%${s}%,id_number.ilike.%${s}%,phone.ilike.%${s}%`
+    );
+  }
+
+  const { data, error } = await q;
+  if (error) throw new ApiError(400, error.message);
+
+  const guests = (data || []).map(mapGuest);
   const rows = await buildFinanceForGuests(guests);
   res.json(rows.map(({ guest, finance }) => ({ ...guest, finance })));
 });
 
 export const getGuest = asyncHandler(async (req, res) => {
-  const guest = await Guest.findById(req.params.id).lean();
-  if (!guest) throw new ApiError(404, 'Guest not found');
+  const { data } = await supabase.from('guests').select('*').eq('id', req.params.id).single();
+  if (!data) throw new ApiError(404, 'Guest not found');
+  const guest = mapGuest(data);
   const finance = await buildGuestFinance(guest);
-  const payments = await Payment.find({ guest: guest._id }).sort({ date: -1 });
-  res.json({ ...guest, finance, payments });
+  const { data: pays } = await supabase
+    .from('payments')
+    .select('*')
+    .eq('guest_id', guest._id)
+    .order('date', { ascending: false });
+  res.json({ ...guest, finance, payments: (pays || []).map(mapPayment) });
 });
 
 // POST /api/guests  (check-in)
 export const checkIn = asyncHandler(async (req, res) => {
-  const { name, idNumber, phone, roomId, checkInDate, expectedCheckOutDate } =
-    req.body;
-
+  const { name, idNumber, phone, roomId, checkInDate, expectedCheckOutDate } = req.body;
   if (!name || !idNumber || !phone || !roomId || !expectedCheckOutDate) {
     throw new ApiError(400, 'name, idNumber, phone, roomId and expectedCheckOutDate are required');
   }
@@ -47,71 +57,81 @@ export const checkIn = asyncHandler(async (req, res) => {
   if (Number.isNaN(ci.getTime()) || Number.isNaN(co.getTime())) {
     throw new ApiError(400, 'Invalid check-in or check-out date');
   }
-  if (co <= ci) {
-    throw new ApiError(400, 'Expected check-out must be after check-in');
-  }
+  if (co <= ci) throw new ApiError(400, 'Expected check-out must be after check-in');
 
-  // Atomically claim the room: only succeeds if it's currently available.
-  // This prevents a check-then-set race that could double-book a room.
-  const room = await Room.findOneAndUpdate(
-    { _id: roomId, status: 'available' },
-    { status: 'occupied' },
-    { new: true }
-  );
-  if (!room) {
-    const existing = await Room.findById(roomId);
+  // Atomically claim the room (only if available) — prevents double-booking.
+  const { data: claimed, error: claimErr } = await supabase.rpc('claim_room', {
+    p_room_id: String(roomId),
+  });
+  if (claimErr) throw new ApiError(400, claimErr.message);
+  if (!claimed || !claimed.length) {
+    const { data: existing } = await supabase.from('rooms').select('*').eq('id', roomId).single();
     if (!existing) throw new ApiError(404, 'Room not found');
     throw new ApiError(400, `Room ${existing.number} is not available (${existing.status})`);
   }
+  const room = claimed[0];
 
-  let guest;
-  try {
-    guest = await Guest.create({
+  const { data, error } = await supabase
+    .from('guests')
+    .insert({
+      id: newId(),
       name,
-      idNumber,
+      id_number: idNumber,
       phone,
-      room: room._id,
-      roomNumber: room.number,
-      dailyRate: room.dailyRate,
-      checkInDate: ci,
-      expectedCheckOutDate: co,
-      createdBy: req.user._id,
-    });
-  } catch (err) {
-    // roll the room back so a failed create doesn't strand it as occupied
-    await Room.findByIdAndUpdate(room._id, { status: 'available' });
-    throw err;
+      room_id: room.id,
+      room_number: room.number,
+      daily_rate: Number(room.daily_rate),
+      check_in_date: ci.toISOString(),
+      expected_check_out_date: co.toISOString(),
+      created_by: req.user._id,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    // roll the room back so a failed insert doesn't strand it as occupied
+    await supabase.from('rooms').update({ status: 'available' }).eq('id', room.id);
+    throw new ApiError(400, error.message);
   }
 
+  const guest = mapGuest(data);
   await logActivity(req, {
     action: 'CHECK_IN',
     entity: 'Guest',
     entityId: guest._id,
     details: `${guest.name} checked into room ${room.number}`,
   });
-
   res.status(201).json(guest);
 });
 
-// PATCH /api/guests/:id  (edit details while checked-in)
+// PATCH /api/guests/:id
 export const updateGuest = asyncHandler(async (req, res) => {
-  const guest = await Guest.findById(req.params.id);
-  if (!guest) throw new ApiError(404, 'Guest not found');
-  if (guest.status === 'checked-out') {
-    throw new ApiError(400, 'Cannot edit a checked-out guest');
-  }
+  const { data: existing } = await supabase.from('guests').select('*').eq('id', req.params.id).single();
+  if (!existing) throw new ApiError(404, 'Guest not found');
+  if (existing.status === 'checked-out') throw new ApiError(400, 'Cannot edit a checked-out guest');
+
   const { name, idNumber, phone, expectedCheckOutDate } = req.body;
-  if (name !== undefined) guest.name = name;
-  if (idNumber !== undefined) guest.idNumber = idNumber;
-  if (phone !== undefined) guest.phone = phone;
+  const patch = { updated_at: new Date().toISOString() };
+  if (name !== undefined) patch.name = name;
+  if (idNumber !== undefined) patch.id_number = idNumber;
+  if (phone !== undefined) patch.phone = phone;
   if (expectedCheckOutDate !== undefined) {
     const co = new Date(expectedCheckOutDate);
-    if (co <= new Date(guest.checkInDate)) {
+    if (co <= new Date(existing.check_in_date)) {
       throw new ApiError(400, 'Expected check-out must be after check-in');
     }
-    guest.expectedCheckOutDate = co;
+    patch.expected_check_out_date = co.toISOString();
   }
-  await guest.save();
+
+  const { data, error } = await supabase
+    .from('guests')
+    .update(patch)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (error) throw new ApiError(400, error.message);
+
+  const guest = mapGuest(data);
   await logActivity(req, {
     action: 'GUEST_UPDATE',
     entity: 'Guest',
@@ -123,39 +143,47 @@ export const updateGuest = asyncHandler(async (req, res) => {
 
 // POST /api/guests/:id/checkout
 export const checkOut = asyncHandler(async (req, res) => {
-  const guest = await Guest.findById(req.params.id);
-  if (!guest) throw new ApiError(404, 'Guest not found');
-  if (guest.status === 'checked-out') {
-    throw new ApiError(400, 'Guest is already checked out');
-  }
+  const { data: existing } = await supabase.from('guests').select('*').eq('id', req.params.id).single();
+  if (!existing) throw new ApiError(404, 'Guest not found');
+  if (existing.status === 'checked-out') throw new ApiError(400, 'Guest is already checked out');
 
-  const actual = req.body.actualCheckOutDate
-    ? new Date(req.body.actualCheckOutDate)
-    : new Date();
-  if (actual < new Date(guest.checkInDate)) {
+  const actual = req.body.actualCheckOutDate ? new Date(req.body.actualCheckOutDate) : new Date();
+  if (Number.isNaN(actual.getTime())) throw new ApiError(400, 'Invalid check-out date');
+  if (actual < new Date(existing.check_in_date)) {
     throw new ApiError(400, 'Check-out date cannot be before check-in');
   }
 
-  // Freeze charges BEFORE flipping status — computeTotalCharges returns the
-  // already-frozen value for checked-out guests, so we must compute while the
-  // guest is still 'checked-in' to get the real figure.
-  guest.totalCharges = round2(
-    computeTotalCharges({ ...guest.toObject(), status: 'checked-in', actualCheckOutDate: actual })
+  const guestObj = mapGuest(existing);
+  // Freeze charges while still 'checked-in' to get the real figure.
+  const frozen = round2(
+    computeTotalCharges({ ...guestObj, status: 'checked-in', actualCheckOutDate: actual })
   );
-  guest.actualCheckOutDate = actual;
-  guest.status = 'checked-out';
-  await guest.save();
+
+  const { data, error } = await supabase
+    .from('guests')
+    .update({
+      actual_check_out_date: actual.toISOString(),
+      status: 'checked-out',
+      total_charges: frozen,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (error) throw new ApiError(400, error.message);
 
   // free the room
-  await Room.findByIdAndUpdate(guest.room, { status: 'available' });
+  if (existing.room_id) {
+    await supabase.from('rooms').update({ status: 'available' }).eq('id', existing.room_id);
+  }
 
+  const guest = mapGuest(data);
   await logActivity(req, {
     action: 'CHECK_OUT',
     entity: 'Guest',
     entityId: guest._id,
     details: `${guest.name} checked out of room ${guest.roomNumber}`,
   });
-
-  const finance = await buildGuestFinance(guest.toObject());
-  res.json({ ...guest.toObject(), finance });
+  const finance = await buildGuestFinance(guest);
+  res.json({ ...guest, finance });
 });

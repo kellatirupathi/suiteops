@@ -1,4 +1,4 @@
-import Payment from '../models/Payment.js';
+import { supabase } from '../config/supabase.js';
 
 // Number of nights billed for a guest. Minimum 1 night.
 // Uses actual checkout if present, otherwise expected checkout (for live dues),
@@ -27,11 +27,12 @@ export function computeTotalCharges(guest, now = new Date()) {
 }
 
 export async function sumPayments(guestId) {
-  const result = await Payment.aggregate([
-    { $match: { guest: toObjectId(guestId) } },
-    { $group: { _id: null, total: { $sum: '$amount' } } },
-  ]);
-  return result.length ? result[0].total : 0;
+  const { data, error } = await supabase
+    .from('payments')
+    .select('amount')
+    .eq('guest_id', guestId);
+  if (error) throw error;
+  return (data || []).reduce((s, p) => s + Number(p.amount), 0);
 }
 
 // Build a finance snapshot from an already-known paid amount (no DB hit).
@@ -53,22 +54,25 @@ export function financeFromPaid(guest, paid, now = new Date()) {
   };
 }
 
-// Build a full financial snapshot for a single guest (one aggregation).
+// Build a full financial snapshot for a single guest.
 export async function buildGuestFinance(guest, now = new Date()) {
   const paid = await sumPayments(guest._id);
   return financeFromPaid(guest, paid, now);
 }
 
-// Sum payments for MANY guests in ONE aggregation -> Map(guestId -> total).
-// Avoids the N+1 query problem when listing guests/dues/analytics.
+// Sum payments for MANY guests in ONE query -> Map(guestId -> total).
+// Avoids the N+1 problem when listing guests/dues/analytics.
 export async function sumPaymentsForGuests(guestIds) {
   if (!guestIds.length) return new Map();
-  const rows = await Payment.aggregate([
-    { $match: { guest: { $in: guestIds.map(toObjectId) } } },
-    { $group: { _id: '$guest', total: { $sum: '$amount' } } },
-  ]);
+  const { data, error } = await supabase
+    .from('payments')
+    .select('guest_id, amount')
+    .in('guest_id', guestIds);
+  if (error) throw error;
   const map = new Map();
-  for (const r of rows) map.set(String(r._id), r.total);
+  for (const p of data || []) {
+    map.set(p.guest_id, (map.get(p.guest_id) || 0) + Number(p.amount));
+  }
   return map;
 }
 
@@ -77,15 +81,8 @@ export async function buildFinanceForGuests(guests, now = new Date()) {
   const paidMap = await sumPaymentsForGuests(guests.map((g) => g._id));
   return guests.map((g) => ({
     guest: g,
-    finance: financeFromPaid(g, paidMap.get(String(g._id)) || 0, now),
+    finance: financeFromPaid(g, paidMap.get(g._id) || 0, now),
   }));
-}
-
-import mongoose from 'mongoose';
-function toObjectId(id) {
-  return id instanceof mongoose.Types.ObjectId
-    ? id
-    : new mongoose.Types.ObjectId(id);
 }
 
 export function round2(n) {

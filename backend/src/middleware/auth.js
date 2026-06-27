@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import { supabase } from '../config/supabase.js';
+import { mapUser } from '../utils/map.js';
 
 export async function protect(req, res, next) {
   try {
@@ -8,11 +9,16 @@ export async function protect(req, res, next) {
     if (!token) return res.status(401).json({ message: 'Not authenticated' });
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
-    if (!user || !user.active) {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', decoded.id)
+      .single();
+
+    if (error || !data || !data.active) {
       return res.status(401).json({ message: 'User no longer active' });
     }
-    req.user = user;
+    req.user = mapUser(data);
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Invalid or expired token' });

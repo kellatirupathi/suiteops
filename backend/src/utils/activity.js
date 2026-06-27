@@ -1,14 +1,16 @@
-import ActivityLog from '../models/ActivityLog.js';
+import { supabase } from '../config/supabase.js';
+import { newId } from './map.js';
 
 // Fire-and-forget activity logging helper for the audit trail.
 export async function logActivity(req, { action, entity, entityId, details }) {
   try {
-    await ActivityLog.create({
-      user: req.user?._id,
-      userName: req.user?.name,
+    await supabase.from('activity_logs').insert({
+      id: newId(),
+      user_id: req.user?._id || null,
+      user_name: req.user?.name || null,
       action,
       entity,
-      entityId,
+      entity_id: entityId,
       details,
     });
   } catch (err) {

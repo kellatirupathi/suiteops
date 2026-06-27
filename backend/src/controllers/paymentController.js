@@ -1,9 +1,8 @@
-import mongoose from 'mongoose';
-import Payment from '../models/Payment.js';
-import Guest from '../models/Guest.js';
+import { supabase } from '../config/supabase.js';
 import { asyncHandler, ApiError } from '../middleware/error.js';
 import { logActivity } from '../utils/activity.js';
 import { buildGuestFinance, buildFinanceForGuests } from '../utils/finance.js';
+import { mapGuest, mapPayment, newId } from '../utils/map.js';
 
 // POST /api/payments
 export const recordPayment = asyncHandler(async (req, res) => {
@@ -15,17 +14,17 @@ export const recordPayment = asyncHandler(async (req, res) => {
   if (!Number.isFinite(amt) || amt <= 0) {
     throw new ApiError(400, 'Amount must be a number greater than 0');
   }
-
-  const guest = await Guest.findById(guestId);
-  if (!guest) throw new ApiError(404, 'Guest not found');
-
   const validModes = ['cash', 'card', 'upi'];
   if (!validModes.includes(mode)) {
     throw new ApiError(400, 'Payment mode must be cash, card or upi');
   }
 
-  // Reject overpayment so the books always reconcile (paid never exceeds charges).
-  const current = await buildGuestFinance(guest.toObject());
+  const { data: g } = await supabase.from('guests').select('*').eq('id', guestId).single();
+  if (!g) throw new ApiError(404, 'Guest not found');
+  const guest = mapGuest(g);
+
+  // Reject overpayment so the books always reconcile.
+  const current = await buildGuestFinance(guest);
   if (amt > current.balanceDue + 0.001) {
     throw new ApiError(
       400,
@@ -33,15 +32,22 @@ export const recordPayment = asyncHandler(async (req, res) => {
     );
   }
 
-  const payment = await Payment.create({
-    guest: guest._id,
-    amount: amt,
-    mode,
-    reference: reference || '',
-    date: date ? new Date(date) : new Date(),
-    recordedBy: req.user._id,
-  });
+  const { data, error } = await supabase
+    .from('payments')
+    .insert({
+      id: newId(),
+      guest_id: guest._id,
+      amount: amt,
+      mode,
+      reference: reference || '',
+      date: date ? new Date(date).toISOString() : new Date().toISOString(),
+      recorded_by: req.user._id,
+    })
+    .select()
+    .single();
+  if (error) throw new ApiError(400, error.message);
 
+  const payment = mapPayment(data);
   await logActivity(req, {
     action: 'PAYMENT',
     entity: 'Payment',
@@ -49,29 +55,51 @@ export const recordPayment = asyncHandler(async (req, res) => {
     details: `Payment ${amt} (${mode}) for ${guest.name} [room ${guest.roomNumber}]`,
   });
 
-  const updatedFinance = await buildGuestFinance(guest.toObject());
-  res.status(201).json({ payment, finance: updatedFinance });
+  const finance = await buildGuestFinance(guest);
+  res.status(201).json({ payment, finance });
 });
 
 // GET /api/payments?guestId=
 export const listPayments = asyncHandler(async (req, res) => {
-  const filter = {};
-  if (req.query.guestId) {
-    if (!mongoose.isValidObjectId(req.query.guestId)) {
-      throw new ApiError(400, 'Invalid guestId');
-    }
-    filter.guest = String(req.query.guestId);
-  }
-  const payments = await Payment.find(filter)
-    .populate('guest', 'name roomNumber')
-    .populate('recordedBy', 'name')
-    .sort({ date: -1 });
-  res.json(payments);
+  let q = supabase.from('payments').select('*').order('date', { ascending: false });
+  if (req.query.guestId) q = q.eq('guest_id', String(req.query.guestId));
+
+  const { data, error } = await q;
+  if (error) throw new ApiError(400, error.message);
+  const payments = (data || []).map(mapPayment);
+
+  // stitch guest + recordedBy names in two batched lookups (no N+1)
+  const guestIds = [...new Set(payments.map((p) => p.guest).filter(Boolean))];
+  const userIds = [...new Set(payments.map((p) => p.recordedBy).filter(Boolean))];
+
+  const [{ data: gs }, { data: us }] = await Promise.all([
+    guestIds.length
+      ? supabase.from('guests').select('id, name, room_number').in('id', guestIds)
+      : Promise.resolve({ data: [] }),
+    userIds.length
+      ? supabase.from('users').select('id, name').in('id', userIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+  const gMap = new Map((gs || []).map((g) => [g.id, g]));
+  const uMap = new Map((us || []).map((u) => [u.id, u]));
+
+  res.json(
+    payments.map((p) => ({
+      ...p,
+      guest: gMap.get(p.guest)
+        ? { name: gMap.get(p.guest).name, roomNumber: gMap.get(p.guest).room_number }
+        : null,
+      recordedBy: uMap.get(p.recordedBy) ? { name: uMap.get(p.recordedBy).name } : null,
+    }))
+  );
 });
 
-// GET /api/payments/dues  -> guests with outstanding balance
+// GET /api/payments/dues
 export const listDues = asyncHandler(async (req, res) => {
-  const guests = await Guest.find().lean();
+  const { data, error } = await supabase.from('guests').select('*');
+  if (error) throw new ApiError(400, error.message);
+
+  const guests = (data || []).map(mapGuest);
   const enriched = await buildFinanceForGuests(guests);
   const rows = enriched
     .filter(({ finance }) => finance.balanceDue > 0)
