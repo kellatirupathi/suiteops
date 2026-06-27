@@ -29,11 +29,6 @@ export default function Login() {
     }
   }
 
-  function fill(role) {
-    setEmail(role === 'manager' ? 'manager@rksuites.com' : 'frontdesk@rksuites.com');
-    setPassword(role === 'manager' ? 'Manager@123' : 'Frontdesk@123');
-  }
-
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[1.05fr_1fr]">
       {/* Brand panel */}
@@ -134,22 +129,6 @@ export default function Login() {
               {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
-
-          <div className="mt-8">
-            <div className="flex items-center gap-3 text-[0.7rem] uppercase tracking-wider text-ink-faint">
-              <span className="h-px flex-1 bg-paper-200" />
-              Demo access
-              <span className="h-px flex-1 bg-paper-200" />
-            </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <button onClick={() => fill('manager')} className="btn-secondary btn-sm">
-                Manager
-              </button>
-              <button onClick={() => fill('frontdesk')} className="btn-secondary btn-sm">
-                Front Desk
-              </button>
-            </div>
-          </div>
         </div>
       </div>
     </div>
